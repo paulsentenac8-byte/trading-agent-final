@@ -1,107 +1,72 @@
-# GitHub + Render — guide clic par clic
+# Déploiement web public — sans installation locale
 
 ## Objectif
-Mettre l'application en ligne avec un vrai lien web, sans installer Python sur ton ordinateur.
+Avoir un **vrai lien web** sans rien installer sur ton ordinateur.
+
+## Meilleur compromis avec tes contraintes
+Le compromis le plus simple est :
+- **hébergement Render**
+- **code déjà préparé**
+- **aucun Python à lancer sur ton PC**
+- tu gères surtout :
+  1. un compte GitHub
+  2. un compte Render
+  3. les clés API si tu veux plus tard connecter des services
 
 ---
 
-## Partie 1 — GitHub
-
-### 1. Créer un compte GitHub
-Va sur :
-- https://github.com/
-
-Clique sur **Sign up**.
+## Ce que tu ne feras pas
+- pas d'installation Python locale
+- pas de terminal local
+- pas de lancement manuel sur ton PC
 
 ---
 
-### 2. Créer un nouveau dépôt
-Une fois connecté :
-1. Clique sur **New**
-2. Nom du dépôt : `trading-agent-debutant`
-3. Laisse le dépôt en **Private** si tu veux garder ça privé
-4. Clique sur **Create repository**
+## Ce que tu feras
+### Étape 1
+Créer un compte GitHub si tu n'en as pas.
+
+### Étape 2
+Mettre ce dossier dans un dépôt GitHub.
+
+### Étape 3
+Créer un compte Render.
+
+### Étape 4
+Sur Render, importer le dépôt GitHub.
+
+### Étape 5
+Render détectera `render.yaml` et déploiera l'application.
+
+### Étape 6
+Tu obtiendras un vrai lien du type :
+`https://ton-app.onrender.com`
 
 ---
 
-### 3. Envoyer les fichiers sur GitHub
-1. Télécharge `trading_agent_mvp.zip`
-2. Décompresse-le sur ton ordinateur
-3. Sur la page GitHub du dépôt, clique sur **uploading an existing file**
-4. Glisse tous les fichiers du dossier `trading_agent_mvp` dans la page
-5. Attends la fin de l'upload
-6. Clique sur **Commit changes**
-
----
-
-## Partie 2 — Render
-
-### 4. Créer un compte Render
-Va sur :
-- https://render.com/
-
-Clique sur **Get Started**.
-
-Tu peux te connecter avec GitHub.
-
----
-
-### 5. Connecter GitHub à Render
-Si Render le demande :
-- autorise l'accès à ton compte GitHub
-
----
-
-### 6. Créer le service web
-1. Dans Render, clique sur **New +**
-2. Clique sur **Web Service**
-3. Choisis le dépôt GitHub `trading-agent-debutant`
-
-Render devrait détecter les fichiers du projet.
-
----
-
-### 7. Vérifier les réglages
-Render doit utiliser le fichier :
+## Fichiers déjà prêts pour ça
 - `render.yaml`
-
-Si besoin, vérifie :
-- Build Command : `pip install --upgrade pip && pip install -r requirements.txt`
-- Start Command : `streamlit run app.py --server.port $PORT --server.address 0.0.0.0`
-
----
-
-### 8. Lancer le déploiement
-Clique sur **Create Web Service**.
-
-Render va :
-- installer les dépendances
-- construire l'application
-- la lancer
+- `.streamlit/config.toml`
+- `app.py`
+- `doctor.py`
 
 ---
 
-### 9. Ouvrir le lien
-Une fois le déploiement terminé, Render te donnera une URL du type :
-- `https://assistant-trading-debutant.onrender.com`
-
-C'est ton vrai lien web.
+## Après déploiement
+Tu auras un vrai lien public à ouvrir dans ton navigateur.
 
 ---
 
-## Si ça échoue
-Regarde les logs Render.
-
-Les premières choses à vérifier :
-- dépôt GitHub bien complet
-- `requirements.txt` présent
-- `render.yaml` présent
-- `app.py` présent
+## Limite importante
+Même avec une vraie app web :
+- un bot live broker 24/7 nécessite encore des API, un broker compatible et des tests sérieux
+- je recommande de garder le mode démo tant que tout n'est pas validé
 
 ---
 
-## Ce que tu me renvoies si tu veux mon aide
-Envoie-moi :
-1. le message d'erreur Render
-2. ou une capture d'écran des logs
-3. ou le lien Render si ça a marché
+## Si tu veux aller au bout
+La prochaine étape logique est que tu me dises :
+- si tu acceptes **GitHub + Render**
+- quel broker/API tu veux utiliser plus tard
+
+Et je te préparerai le plan exact de mise en ligne.

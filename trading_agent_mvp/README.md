@@ -1,86 +1,82 @@
-# Trading Agent — quant pro v4 / production-grade retail
+# Trading Agent — Zip complet v2 (Alpaca + interface adaptée)
 
-Base de trading orientée actions / ETF avec :
-- score multi-stratégies,
-- classification de régimes plus fine,
-- breadth de marché,
-- filtres macro / news / earnings,
-- diversification par corrélation et secteur,
-- caps d'allocation,
-- contrôles pré-trade,
-- meta-risk overlay,
-- kill switch,
-- stress tests,
-- Monte Carlo,
-- walk-forward analysis,
-- sensibilité des paramètres,
-- attribution facteurs,
-- diagnostics de performance vs benchmark,
-- qualité de données,
-- mémoire / historique SQLite,
-- tracking des outcomes des signaux,
-- learning engine supervisé initial,
-- journal de décision,
-- audit manifest,
-- santé broker / monitoring,
-- interface web Streamlit,
-- flux broker à validation humaine.
+## ✅ Ce zip est maintenant complet
 
-## Fichiers principaux
-- `app.py` : entrée web
-- `main.py` : pipeline quant principal
-- `interface_debutant.py` : interface utilisateur
-- `doctor.py` : diagnostic
-- `submit_ibkr_orders.py` : préparation / soumission broker
-- `render.yaml` : déploiement Render
+`interface_debutant.py` est inclus en entier et a été adapté pour utiliser
+Alpaca à la place d'IBKR. Tu n'as plus aucun fichier à ajouter toi-même.
 
-## Modules quant principaux
-- `src/signals.py`
-- `src/features.py`
-- `src/breadth.py`
-- `src/portfolio.py`
-- `src/sector.py`
-- `src/pretrade.py`
-- `src/metarisk.py`
-- `src/killswitch.py`
-- `src/stress.py`
-- `src/monte_carlo.py`
-- `src/walkforward.py`
-- `src/sensitivity.py`
-- `src/analytics.py`
-- `src/attribution.py`
-- `src/data_quality.py`
-- `src/journal.py`
-- `src/audit.py`
-- `src/broker_health.py`
-- `src/monitoring.py`
-- `src/validation.py`
+---
 
-## Rapports produits
-- `reports/ranked_signals.csv`
-- `reports/orders_to_review.csv`
-- `data/trading_agent.sqlite`
-- `reports/risk_summary.json`
-- `reports/exposure_summary.json`
-- `reports/pretrade_summary.json`
-- `reports/meta_risk_summary.json`
-- `reports/kill_switch_summary.json`
-- `reports/stress_test_summary.json`
-- `reports/monte_carlo_summary.json`
-- `reports/walkforward_summary.json`
-- `reports/walkforward_windows.csv`
-- `reports/sensitivity_summary.json`
-- `reports/sensitivity_grid.csv`
-- `reports/attribution_summary.json`
-- `reports/performance_diagnostics.json`
-- `reports/validation_summary.json`
-- `reports/data_quality_summary.json`
-- `reports/decision_journal.json`
-- `reports/broker_health_summary.json`
-- `reports/monitoring_summary.json`
-- `reports/audit_manifest.json`
-- `reports/breadth_context.json`
-- `reports/pipeline_status.json`
+## Ce qui a changé par rapport à ton repo actuel
 
-## Important
-Le projet est maintenant une **base quant retail très avancée et orientée production-grade**, mais pas un desk institutionnel complet et pas une garantie de gains.
+### Nouveaux fichiers
+- `src/alpaca_broker.py` — connecteur Alpaca, fonctionne depuis Render
+  (contrairement à IBKR qui exige un logiciel local TWS allumé sur ton PC)
+- `src/storage.py` — base SQLite pour l'historique des analyses et
+  l'apprentissage (utilisé par l'onglet "Historique & learning" de
+  l'interface)
+- `submit_alpaca_orders.py` — script qui envoie les ordres validés à Alpaca
+- `dashboard_pro.py` — interface premium sombre alternative, avec graphiques
+  (courbe d'équité, répartition des positions). Optionnelle, en complément
+  de `interface_debutant.py`.
+
+### Fichiers modifiés
+- **`interface_debutant.py`** — les boutons "Aperçu broker" et "Envoyer au
+  broker démo" appellent maintenant `submit_alpaca_orders.py` au lieu de
+  `submit_ibkr_orders.py`. Rien d'autre n'a changé dans cette interface.
+- **`main.py`** — ajout d'un appel à `store_pipeline_run()` à la fin du
+  pipeline, pour que l'historique et l'apprentissage se remplissent
+  automatiquement à chaque analyse.
+- `config.json`, `config.example.json` — `broker.mode` passe à `"alpaca"`
+- `src/config.py` — ajout des champs de configuration Alpaca
+- `src/risk.py`, `src/pretrade.py`, `src/signals.py` — alignés sur les
+  versions montrées (utilisant `scalars.py` pour plus de robustesse)
+- `doctor.py`, `start.py` — bug corrigé (référençaient un fichier
+  `lancer_assistant.py` qui n'a jamais existé)
+- `requirements.txt` — retire `ib-insync`, ajoute `plotly`
+
+### Fichiers inchangés
+`README.md`, `render.yaml`, `app_state.json`, `DEPLOY_WEB_PUBLIC.md`,
+`GITHUB_RENDER_CLIC_PAR_CLIC.md`, `submit_ibkr_orders.py` (gardé pour
+référence), `.streamlit/config.toml`, et tous les autres fichiers de `src/`.
+
+---
+
+## Étapes pour déployer
+
+### 1. Crée ton compte Alpaca (gratuit)
+Sur https://alpaca.markets, section **Paper Trading** → génère une clé API
+(API Key ID + Secret Key).
+
+### 2. Remplace tout sur ton repo GitHub
+Supprime tous les fichiers de ton repo GitHub actuel, puis upload
+l'intégralité du contenu de ce zip (en respectant les dossiers `src/` et
+`.streamlit/`).
+
+### 3. Ajoute tes clés dans Render (jamais sur GitHub)
+Render → ton service → **Environment** :
+- `ALPACA_API_KEY` → ton API Key ID
+- `ALPACA_API_SECRET` → ton Secret Key
+
+### 4. Vérifie le déploiement
+Ouvre l'URL de ton app Render. Tu devrais voir ton interface habituelle.
+
+### 5. Premier test, sans risque
+1. Lance une analyse
+2. Approuve les ordres voulus dans l'onglet de validation
+3. "Aperçu broker" (dry-run, ne contacte pas Alpaca)
+4. "Envoyer au broker démo" (envoie réellement, mais au compte paper —
+   argent fictif, zéro risque tant que paper_only=true)
+
+### 6. (Optionnel) Dashboard premium
+Render → Settings → Start Command :
+```
+streamlit run dashboard_pro.py --server.port $PORT --server.address 0.0.0.0
+```
+
+---
+
+## Garde-fous toujours actifs
+- `paper_only: true` par défaut
+- Kill switch, stress tests, meta-risk overlay : inchangés
+- Aucune clé API écrite dans un fichier versionné

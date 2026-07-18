@@ -1,7 +1,15 @@
-{
-  "autopilot": true,
-  "refresh_minutes": 30,
-  "auto_preview": true,
-  "last_auto_attempt": null,
-  "last_auto_success": null
-}
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#3b82f6"
+backgroundColor = "#06070a"
+secondaryBackgroundColor = "#0f1722"
+textColor = "#f3f4f6"
+font = "sans serif"

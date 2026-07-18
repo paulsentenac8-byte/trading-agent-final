@@ -1,80 +1,28 @@
 from __future__ import annotations
 
-import argparse
-import traceback
+import json
+import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import streamlit as st
 
-from src.attribution import build_attribution_summary
-from src.audit import build_audit_manifest
-from src.anomaly import detect_anomalies
-from src.backtest import run_rotation_backtest
-from src.breadth import build_breadth_context
-from src.broker import BrokerOrder, IBKRManualApprovalBroker, ManualApprovalBroker
-from src.broker_health import check_broker_health
-from src.config import load_config
-from src.data import download_ohlcv, filter_liquid_universe
-from src.data_quality import build_data_quality_summary
-from src.earnings import build_earnings_context
-from src.features import add_features, latest_snapshot
-from src.macro import build_macro_context
-from src.analytics import build_performance_diagnostics
-from src.exposure import build_exposure_summary
-from src.journal import build_decision_journal
-from src.killswitch import apply_kill_switch
-from src.metarisk import MetaRiskSummary, apply_meta_risk_overlays
-from src.monte_carlo import run_monte_carlo_analysis
-from src.monitoring import build_monitoring_summary
-from src.news import build_news_context
-from src.regression import build_regression_checklist
-from src.portfolio import apply_allocation_caps, can_take_long_risk, diversify_trade_plan
-from src.pretrade import PreTradeSummary, apply_pretrade_controls
-from src.readiness import build_readiness_summary
-from src.reporting import (
-    save_backtest_stats,
-    save_dataframe_artifact,
-    save_json_artifact,
-    save_ranked_signals,
-    save_report,
-)
-from src.risk import build_trade_plan
-from src.runtime import exclusive_lock, utc_now_iso
-from src.scalars import to_float, to_int
-from src.sector import apply_sector_limits
-from src.signals import MarketContext, infer_market_regime, rank_universe
-from src.sensitivity import run_sensitivity_analysis
-from src.storage import load_history_summary, load_learning_summary, store_pipeline_run, update_signal_outcomes
-from src.stress import run_stress_tests
-from src.validation import build_validation_summary
-from src.walkforward import WalkForwardSummary, run_walkforward_analysis
+from src.storage import load_history_summary, load_learning_summary
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:  # pragma: no cover
+    def st_autorefresh(*args: Any, **kwargs: Any) -> int:
+        return 0
 
 
-RANKED_COLUMNS = [
-    "symbol",
-    "date",
-    "score",
-    "close",
-    "rsi_14",
-    "vol_20",
-    "mom_20",
-    "mom_60",
-    "rel_strength_20",
-    "atr_14",
-    "avg_dollar_volume_20",
-    "market_news_bias",
-    "symbol_news_bias",
-    "event_bias",
-    "macro_bias",
-    "breadth_bias",
-    "trend_component",
-    "momentum_component",
-    "breakout_component",
-    "pullback_component",
-    "quality_component",
-    "reasons",
-]
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / "config.json"
+REPORTS_DIR = ROOT / "reports"
+APP_STATE_PATH = ROOT / "app_state.json"
 
 ORDER_COLUMNS = [
     "symbol",
@@ -92,705 +40,1016 @@ ORDER_COLUMNS = [
     "review_comment",
 ]
 
+RANKED_COLUMNS = [
+    "symbol",
+    "date",
+    "score",
+    "close",
+    "rsi_14",
+    "vol_20",
+    "mom_20",
+    "mom_60",
+    "rel_strength_20",
+    "atr_14",
+    "avg_dollar_volume_20",
+    "market_news_bias",
+    "symbol_news_bias",
+    "event_bias",
+    "macro_bias",
+    "reasons",
+]
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Trading Agent MVP")
-    parser.add_argument("--config", default="config.json", help="Chemin vers le fichier de config JSON")
-    return parser.parse_args()
 
-
-def empty_ranked_df() -> pd.DataFrame:
-    return pd.DataFrame(columns=RANKED_COLUMNS)
-
-
-def empty_orders_df() -> pd.DataFrame:
-    return pd.DataFrame(columns=ORDER_COLUMNS)
-
-
-def summarize_risk(trade_plan: pd.DataFrame, capital: float, max_positions: int, risk_per_trade: float) -> dict[str, Any]:
-    if trade_plan.empty:
-        return {
-            "n_orders": 0,
-            "capital": round(float(capital), 2),
-            "risk_per_trade": round(float(risk_per_trade), 4),
-            "max_positions": int(max_positions),
-            "estimated_total_allocation": 0.0,
-            "estimated_cash_remaining": round(float(capital), 2),
-            "estimated_total_risk_amount": 0.0,
-            "average_stop_pct": 0.0,
-            "notes": ["Aucun ordre proposé actuellement."],
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        #MainMenu, footer, header {visibility: hidden;}
+        :root {
+          --bg: #06070a;
+          --bg-soft: #0c1117;
+          --card: #10161f;
+          --card-2: #0f1722;
+          --line: #1f2937;
+          --text: #f3f4f6;
+          --muted: #94a3b8;
+          --green: #22c55e;
+          --yellow: #f59e0b;
+          --blue: #3b82f6;
+          --red: #ef4444;
         }
-
-    total_allocation = float(trade_plan.get("allocation", pd.Series(dtype=float)).fillna(0).sum())
-    average_stop_pct = float(trade_plan.get("stop_pct", pd.Series(dtype=float)).fillna(0).mean())
-    total_risk_amount = float(trade_plan.get("risk_amount", pd.Series(dtype=float)).fillna(0).sum())
-    cash_remaining = max(float(capital) - total_allocation, 0.0)
-
-    return {
-        "n_orders": int(len(trade_plan)),
-        "capital": round(float(capital), 2),
-        "risk_per_trade": round(float(risk_per_trade), 4),
-        "max_positions": int(max_positions),
-        "estimated_total_allocation": round(total_allocation, 2),
-        "estimated_cash_remaining": round(cash_remaining, 2),
-        "estimated_total_risk_amount": round(total_risk_amount, 2),
-        "average_stop_pct": round(average_stop_pct, 4),
-        "notes": [
-            "Le montant de risque estimé dépend du prix d'exécution réel et des écarts de marché.",
-            "Le système reste configuré pour attendre une validation humaine avant envoi broker.",
-        ],
-    }
-
-
-def build_action_center(
-    ranked: pd.DataFrame,
-    trade_plan: pd.DataFrame,
-    regime: str,
-    macro_bias: float,
-    market_news_bias: float,
-    breadth_bias: float,
-    paper_only: bool,
-    validation_summary: dict[str, Any],
-    meta_risk_summary: dict[str, Any],
-    kill_switch_summary: dict[str, Any],
-    readiness_summary: dict[str, Any],
-) -> dict[str, Any]:
-    warnings = (
-        list(validation_summary.get("warnings", []))
-        + list(meta_risk_summary.get("reasons", []))
-        + list(kill_switch_summary.get("reasons", []))
-        + list(readiness_summary.get("blockers", []))
+        html, body, [class*="css"] {
+          background: var(--bg) !important;
+          color: var(--text) !important;
+        }
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        section.main,
+        .main,
+        .main .block-container {
+          background: linear-gradient(180deg, #050608 0%, #0a0f16 100%) !important;
+          color: var(--text) !important;
+        }
+        [data-testid="stHeader"] {background: transparent !important;}
+        [data-testid="stSidebar"] {background: #0a0f16 !important; border-right: 1px solid var(--line);}        
+        .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1260px;}
+        h1, h2, h3, h4, h5, h6, p, li, label, div, span {color: var(--text) !important;}        
+        div.stButton > button {
+            border-radius: 12px;
+            padding: 0.72rem 1rem;
+            font-weight: 700;
+            border: 1px solid #243244;
+            background: linear-gradient(180deg, #111827, #0b1220) !important;
+            color: #f8fafc !important;
+        }
+        div.stButton > button:hover {border-color: #3b82f6; color: white;}
+        [data-testid="stMetric"] {
+            background: linear-gradient(180deg, rgba(17,24,39,0.96), rgba(15,23,42,0.88)) !important;
+            border: 1px solid var(--line) !important;
+            border-radius: 16px;
+            padding: 14px 16px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+        }
+        [data-testid="stMetricLabel"] {color: var(--muted);}        
+        .hero {
+            background: linear-gradient(135deg, #050b14, #0b1524 50%, #1d4ed8 100%);
+            color: white;
+            padding: 1.35rem 1.45rem;
+            border-radius: 20px;
+            margin-bottom: 1rem;
+            border: 1px solid #1f2937;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+        }
+        .hero h1 {margin: 0; font-size: 2rem;}
+        .hero p {margin: 0.4rem 0 0 0; color: #cbd5e1;}
+        .step-card {
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 0.9rem 1rem;
+            background: linear-gradient(180deg, #0c1117, #0b1220);
+            min-height: 130px;
+        }
+        .step-done {border-left: 8px solid var(--green);}
+        .step-wait {border-left: 8px solid var(--yellow);}
+        .pill {
+            display: inline-block;
+            padding: 0.3rem 0.7rem;
+            border-radius: 999px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            margin-right: 0.4rem;
+            margin-bottom: 0.4rem;
+            border: 1px solid rgba(255,255,255,0.08);
+        }
+        .pill-green {background: rgba(34,197,94,0.12); color: #86efac;}
+        .pill-yellow {background: rgba(245,158,11,0.12); color: #fcd34d;}
+        .pill-blue {background: rgba(59,130,246,0.12); color: #93c5fd;}
+        .trade-card {
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 1rem;
+            background: linear-gradient(180deg, #0f1722, #0b1220);
+            margin-bottom: 0.8rem;
+        }
+        .small-muted {color: var(--muted); font-size: 0.92rem;}
+        [data-testid="stExpander"] {
+            background: rgba(15,23,42,0.65) !important;
+            border: 1px solid var(--line) !important;
+            border-radius: 14px;
+        }
+        [data-testid="stMarkdownContainer"], .stAlert {
+            background: transparent !important;
+        }
+        [data-testid="stDataFrame"] {border: 1px solid var(--line) !important; border-radius: 14px; overflow: hidden; background: #0f1722 !important;}
+        [data-testid="stDataFrame"] * {background: transparent !important; color: var(--text) !important;}
+        .stTabs [data-baseweb="tab-list"] {gap: 8px;}
+        .stTabs [data-baseweb="tab"] {
+            background: #0c1117;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            color: #e5e7eb;
+            padding: 10px 14px;
+        }
+        .stTabs [aria-selected="true"] {background: #111827; border-color: #3b82f6;}
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-    if ranked.empty:
-        return {
-            "status": "no_analysis",
-            "headline": "Aucune opportunité exploitable pour le moment.",
-            "next_step": "Relancer l'analyse plus tard ou élargir l'univers.",
-            "regime": regime,
-            "paper_only": paper_only,
-            "macro_bias": round(float(macro_bias), 4),
-            "market_news_bias": round(float(market_news_bias), 4),
-            "breadth_bias": round(float(breadth_bias), 4),
-            "warnings": warnings,
-            "top_symbols": [],
-        }
 
-    top_symbols = ranked.head(3)[["symbol", "score", "close"]].to_dict(orient="records")
 
-    if trade_plan.empty:
-        return {
-            "status": "analysis_ready_no_orders",
-            "headline": "Analyse terminée mais aucun trade n'a passé les filtres finaux.",
-            "next_step": "Lire le rapport et attendre un meilleur contexte de marché.",
-            "regime": regime,
-            "paper_only": paper_only,
-            "macro_bias": round(float(macro_bias), 4),
-            "market_news_bias": round(float(market_news_bias), 4),
-            "breadth_bias": round(float(breadth_bias), 4),
-            "warnings": warnings,
-            "top_symbols": top_symbols,
-        }
+@st.cache_data(show_spinner=False)
+def read_csv_safe(path_str: str) -> pd.DataFrame:
+    path = Path(path_str)
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
+
+@st.cache_data(show_spinner=False)
+def read_json_safe(path_str: str) -> dict[str, Any]:
+    path = Path(path_str)
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True)
+
+
+def clear_cache() -> None:
+    st.cache_data.clear()
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {}
+    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def save_config(data: dict[str, Any]) -> None:
+    CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def default_app_state() -> dict[str, Any]:
     return {
-        "status": "orders_ready",
-        "headline": f"{len(trade_plan)} trade(s) sont prêts à être revus.",
-        "next_step": "Va dans l'onglet d'autorisation, coche les trades voulus, puis envoie au broker démo.",
-        "regime": regime,
-        "paper_only": paper_only,
-        "macro_bias": round(float(macro_bias), 4),
-        "market_news_bias": round(float(market_news_bias), 4),
-        "breadth_bias": round(float(breadth_bias), 4),
-        "warnings": warnings,
-        "top_symbols": top_symbols,
+        "autopilot": True,
+        "refresh_minutes": 30,
+        "auto_preview": True,
+        "last_auto_attempt": None,
+        "last_auto_success": None,
     }
 
 
-def _default_walkforward_summary() -> WalkForwardSummary:
-    return WalkForwardSummary(False, 0, {}, 0.0, 0.0, 0.0, ["Walk-forward désactivé."])
+def load_app_state() -> dict[str, Any]:
+    if not APP_STATE_PATH.exists():
+        return default_app_state()
+    try:
+        data = json.loads(APP_STATE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default_app_state()
+    merged = default_app_state()
+    merged.update(data)
+    return merged
 
 
-def _default_meta_summary(reason: str = "Meta-risk non appliqué.") -> MetaRiskSummary:
-    return MetaRiskSummary(True, 1.0, 100, [reason])
+def save_app_state(state: dict[str, Any]) -> None:
+    APP_STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _save_empty_or_df(name: str, df: pd.DataFrame, report_dir: str) -> None:
+def ensure_session_defaults() -> None:
+    st.session_state.setdefault("last_run_stdout", "")
+    st.session_state.setdefault("last_run_stderr", "")
+    st.session_state.setdefault("last_submit_stdout", "")
+    st.session_state.setdefault("last_submit_stderr", "")
+    st.session_state.setdefault("last_doctor_stdout", "")
+    st.session_state.setdefault("last_doctor_stderr", "")
+    st.session_state.setdefault("bootstrap_done", False)
+
+
+def to_iso_now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def parse_dt(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    try:
+        ts = pd.to_datetime(value)
+        if pd.isna(ts):
+            return None
+        if getattr(ts, "tzinfo", None) is not None:
+            ts = ts.tz_convert(None)
+        return ts.to_pydatetime()
+    except Exception:
+        return None
+
+
+def minutes_since(value: Any) -> float | None:
+    dt = parse_dt(value)
+    if dt is None:
+        return None
+    return max((datetime.now() - dt).total_seconds() / 60.0, 0.0)
+
+
+def humanize_age(value: Any) -> str:
+    mins = minutes_since(value)
+    if mins is None:
+        return "jamais"
+    if mins < 1:
+        return "à l'instant"
+    if mins < 60:
+        return f"il y a {int(mins)} min"
+    hours = mins / 60.0
+    if hours < 24:
+        return f"il y a {int(hours)} h"
+    return f"il y a {int(hours // 24)} j"
+
+
+def status_file_path() -> Path:
+    return REPORTS_DIR / "pipeline_status.json"
+
+
+def get_pipeline_status() -> dict[str, Any]:
+    status = read_json_safe(str(status_file_path()))
+    if status:
+        return status
+    report = REPORTS_DIR / "latest_report.md"
+    if report.exists():
+        return {"completed_at": datetime.fromtimestamp(report.stat().st_mtime).isoformat(timespec="seconds")}
+    return {}
+
+
+def should_auto_run(app_state: dict[str, Any], pipeline_status: dict[str, Any]) -> bool:
+    if not app_state.get("autopilot", True):
+        return False
+    refresh_minutes = int(app_state.get("refresh_minutes", 30))
+    last_completed_age = minutes_since(pipeline_status.get("completed_at"))
+    last_attempt_age = minutes_since(app_state.get("last_auto_attempt"))
+
+    if last_completed_age is None:
+        return last_attempt_age is None or last_attempt_age >= refresh_minutes
+    return last_completed_age >= refresh_minutes and (last_attempt_age is None or last_attempt_age >= refresh_minutes)
+
+
+def normalize_orders(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
-        pd.DataFrame().to_csv(Path(report_dir) / name, index=False)
+        return pd.DataFrame(columns=ORDER_COLUMNS)
+    out = df.copy()
+    for col in ORDER_COLUMNS:
+        if col not in out.columns:
+            out[col] = "" if col not in {"qty", "reference_price", "stop_loss", "take_profit", "limit_price"} else 0
+    out = out[ORDER_COLUMNS]
+    out["approved"] = out["approved"].astype(str).str.lower().isin(["true", "1", "yes", "y", "oui"])
+    return out
+
+
+def normalize_ranked(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=RANKED_COLUMNS)
+    out = df.copy()
+    for col in RANKED_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    return out[RANKED_COLUMNS]
+
+
+def save_orders(df: pd.DataFrame) -> None:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(REPORTS_DIR / "orders_to_review.csv", index=False)
+    clear_cache()
+
+
+def generate_preview() -> bool:
+    result = run_command(
+        [
+            sys.executable,
+            str(ROOT / "submit_alpaca_orders.py"),
+            "--config",
+            str(CONFIG_PATH),
+            "--orders",
+            str(REPORTS_DIR / "orders_to_review.csv"),
+            "--dry-run",
+        ]
+    )
+    st.session_state["last_submit_stdout"] = result.stdout or ""
+    st.session_state["last_submit_stderr"] = result.stderr or ""
+    clear_cache()
+    return result.returncode == 0
+
+
+def run_analysis_cycle(auto_preview: bool = True) -> bool:
+    result = run_command([sys.executable, str(ROOT / "main.py"), "--config", str(CONFIG_PATH)])
+    st.session_state["last_run_stdout"] = result.stdout or ""
+    st.session_state["last_run_stderr"] = result.stderr or ""
+    clear_cache()
+    success = result.returncode == 0
+    if success and auto_preview:
+        success = generate_preview() and success
+    return success
+
+
+def submit_orders() -> bool:
+    result = run_command(
+        [
+            sys.executable,
+            str(ROOT / "submit_alpaca_orders.py"),
+            "--config",
+            str(CONFIG_PATH),
+            "--orders",
+            str(REPORTS_DIR / "orders_to_review.csv"),
+            "--submit",
+        ]
+    )
+    st.session_state["last_submit_stdout"] = result.stdout or ""
+    st.session_state["last_submit_stderr"] = result.stderr or ""
+    clear_cache()
+    return result.returncode == 0
+
+
+def run_doctor() -> bool:
+    result = run_command([sys.executable, str(ROOT / "doctor.py")])
+    st.session_state["last_doctor_stdout"] = result.stdout or ""
+    st.session_state["last_doctor_stderr"] = result.stderr or ""
+    return result.returncode == 0
+
+
+def update_beginner_settings(capital: float, risk_level: str, paper_only: bool) -> None:
+    cfg = load_config()
+    cfg["initial_capital"] = float(capital)
+    cfg.setdefault("broker", {})
+    cfg["broker"]["paper_only"] = bool(paper_only)
+
+    if risk_level == "Prudent":
+        cfg["risk_per_trade"] = 0.005
+        cfg["max_positions"] = 3
+        cfg["max_position_weight"] = 0.10
+    elif risk_level == "Équilibré":
+        cfg["risk_per_trade"] = 0.01
+        cfg["max_positions"] = 5
+        cfg["max_position_weight"] = 0.20
     else:
-        save_dataframe_artifact(name, df, report_dir)
+        cfg["risk_per_trade"] = 0.015
+        cfg["max_positions"] = 6
+        cfg["max_position_weight"] = 0.25
+
+    save_config(cfg)
 
 
-def run_pipeline(config_path: str) -> None:
-    config = load_config(config_path)
-    report_dir = Path(config.report_dir)
-    report_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = report_dir / "pipeline.lock"
+def approval_key(index: int, symbol: str) -> str:
+    return f"approve_{index}_{symbol}"
 
-    with exclusive_lock(lock_path) as acquired:
-        if not acquired:
-            save_json_artifact(
-                "pipeline_status.json",
-                {
-                    "state": "busy",
-                    "message": "Une autre analyse est déjà en cours.",
-                    "updated_at": utc_now_iso(),
-                    "report_dir": str(report_dir),
-                },
-                str(report_dir),
-            )
-            print("Une autre analyse est déjà en cours.")
-            return
 
-        save_json_artifact(
-            "pipeline_status.json",
-            {
-                "state": "running",
-                "message": "Analyse en cours.",
-                "started_at": utc_now_iso(),
-                "report_dir": str(report_dir),
-            },
-            str(report_dir),
-        )
+def init_approval_state(orders: pd.DataFrame) -> None:
+    for idx, row in orders.reset_index(drop=True).iterrows():
+        key = approval_key(idx, str(row["symbol"]))
+        if key not in st.session_state:
+            st.session_state[key] = bool(row["approved"])
 
-        try:
-            symbols = list(dict.fromkeys(config.universe + [config.benchmark]))
-            market_data = download_ohlcv(symbols, start_date=config.start_date)
-            if config.benchmark not in market_data:
-                raise RuntimeError(f"Benchmark introuvable dans les données: {config.benchmark}")
 
-            eligible_symbols = filter_liquid_universe(
-                market_data,
-                min_price=config.min_price,
-                min_avg_dollar_volume=config.min_avg_dollar_volume,
-            )
-            data_quality_summary = build_data_quality_summary(
-                requested_symbols=symbols,
-                market_data=market_data,
-                eligible_symbols=eligible_symbols,
-                benchmark_symbol=config.benchmark,
-                min_history_bars=config.data_quality.min_history_bars,
-                max_stale_days=config.data_quality.max_stale_days,
-                min_coverage_ratio=config.data_quality.min_coverage_ratio,
-            )
-            eligible_data = {s: market_data[s] for s in eligible_symbols if s in market_data}
-            eligible_data[config.benchmark] = market_data[config.benchmark]
+def build_orders_from_session(orders: pd.DataFrame) -> pd.DataFrame:
+    updated = orders.copy().reset_index(drop=True)
+    for idx, row in updated.iterrows():
+        updated.at[idx, "approved"] = bool(st.session_state.get(approval_key(idx, str(row["symbol"])), False))
+    return updated
 
-            macro_context = build_macro_context(config.macro)
-            news_symbols = list(dict.fromkeys(eligible_symbols + [config.benchmark] + config.news.market_symbols))
-            news_context = build_news_context(news_symbols, config.news, config.benchmark)
-            earnings_context = build_earnings_context(eligible_symbols, config.earnings)
 
-            benchmark_features = add_features(market_data[config.benchmark])
-            regime = infer_market_regime(benchmark_features, config.regime_override)
+def set_bulk_approvals(orders: pd.DataFrame, mode: str) -> None:
+    for idx, row in orders.reset_index(drop=True).iterrows():
+        key = approval_key(idx, str(row["symbol"]))
+        if mode == "all":
+            st.session_state[key] = True
+        elif mode == "none":
+            st.session_state[key] = False
+        elif mode == "top3":
+            st.session_state[key] = idx < 3
 
-            feature_map: dict[str, pd.DataFrame] = {}
-            snapshots: dict[str, dict] = {}
-            for symbol in eligible_symbols:
-                feats = add_features(market_data[symbol], market_data[config.benchmark])
-                if feats.empty:
-                    continue
-                feature_map[symbol] = feats
-                snapshots[symbol] = latest_snapshot(feats)
 
-            breadth_context = build_breadth_context(snapshots)
-            effective_breadth_bias = breadth_context.breadth_bias if config.strategy.use_breadth_filter else 0.0
+def signal_strength(score: float) -> tuple[str, str]:
+    if score >= 4:
+        return "fort", "🟢"
+    if score >= 2.5:
+        return "correct", "🟡"
+    return "faible", "🔴"
 
-            context = MarketContext(
-                macro_bias=config.macro_bias + macro_context.bias,
-                news_bias=config.news_bias + news_context.market_bias,
-                breadth_bias=effective_breadth_bias,
-                regime=regime,
-                symbol_news_bias=news_context.symbol_bias,
-                symbol_event_bias=earnings_context.symbol_penalty,
-            )
 
-            ranked = rank_universe(snapshots, context)
+def show_step_card(title: str, done: bool, description: str) -> None:
+    css_class = "step-done" if done else "step-wait"
+    emoji = "✅" if done else "⏳"
+    st.markdown(
+        f"<div class='step-card {css_class}'><h4>{emoji} {title}</h4><p>{description}</p></div>",
+        unsafe_allow_html=True,
+    )
 
-            if not can_take_long_risk(
-                regime=regime,
-                breadth_bias=effective_breadth_bias,
-                allow_long_only_in_bear=config.strategy.allow_long_only_in_bear,
-                breadth_risk_off_threshold=config.strategy.breadth_risk_off_threshold,
-                rebalance_to_cash_in_bear=config.portfolio.rebalance_to_cash_in_bear,
-            ):
-                trade_plan = pd.DataFrame(columns=ranked.columns)
-                pretrade_summary = PreTradeSummary(0, 0, 0.0, ["Régime / breadth trop défavorable pour prendre du risque long."])
-            else:
-                trade_plan = build_trade_plan(
-                    ranked=ranked,
-                    capital=config.initial_capital,
-                    max_positions=config.max_positions,
-                    risk_per_trade=config.risk_per_trade,
-                    max_position_weight=config.max_position_weight,
-                    min_score=config.strategy.min_score,
-                )
-                trade_plan = diversify_trade_plan(
-                    trade_plan=trade_plan,
-                    feature_map=feature_map,
-                    capital=config.initial_capital,
-                    max_positions=config.max_positions,
-                    max_pairwise_correlation=config.portfolio.max_pairwise_correlation,
-                    min_cash_buffer=config.portfolio.min_cash_buffer,
-                )
-                trade_plan = apply_sector_limits(
-                    trade_plan=trade_plan,
-                    max_sector_positions=config.portfolio.max_sector_positions,
-                ).head(config.max_positions)
-                trade_plan = apply_allocation_caps(
-                    trade_plan=trade_plan,
-                    capital=config.initial_capital,
-                    max_sector_allocation_pct=config.portfolio.max_sector_allocation_pct,
-                    max_gross_exposure_pct=config.portfolio.max_gross_exposure_pct,
-                )
-                trade_plan, pretrade_summary = apply_pretrade_controls(
-                    trade_plan=trade_plan,
-                    capital=config.initial_capital,
-                    config=config.pretrade,
-                )
 
-            equity_curve, stats = run_rotation_backtest(
-                market_data=eligible_data,
-                benchmark_symbol=config.benchmark,
-                max_positions=config.max_positions,
-                rebalance_frequency=config.rebalance_frequency,
-                transaction_cost_bps=config.transaction_cost_bps,
-                context=MarketContext(
-                    macro_bias=config.macro_bias + macro_context.bias,
-                    news_bias=config.news_bias + news_context.market_bias,
-                    breadth_bias=effective_breadth_bias,
-                ),
-                regime_override=config.regime_override,
-                min_score=config.strategy.min_score,
-            )
+def show_hero(app_state: dict[str, Any], pipeline_status: dict[str, Any], cfg: dict[str, Any]) -> None:
+    last_run = humanize_age(pipeline_status.get("completed_at"))
+    mode = "Démo" if cfg.get("broker", {}).get("paper_only", True) else "Réel"
+    autopilot = "Activé" if app_state.get("autopilot", True) else "Désactivé"
+    st.markdown(
+        f"""
+        <div class='hero'>
+            <h1>Assistant Trading Débutant — Premium</h1>
+            <p>Le système analyse automatiquement le marché. Toi, tu n'as qu'à autoriser ou refuser les trades.</p>
+            <div style='margin-top: 0.8rem;'>
+                <span class='pill pill-green'>Dernière analyse : {last_run}</span>
+                <span class='pill pill-blue'>Mode broker : {mode}</span>
+                <span class='pill pill-yellow'>Pilote automatique : {autopilot}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-            if not ranked.empty:
-                save_ranked_signals(ranked, str(report_dir))
-            else:
-                empty_ranked_df().to_csv(report_dir / "ranked_signals.csv", index=False)
 
-            save_backtest_stats(stats, str(report_dir))
-            save_json_artifact("macro_context.json", macro_context.to_dict(), str(report_dir))
-            save_json_artifact("news_context.json", news_context.to_dict(), str(report_dir))
-            save_json_artifact("earnings_context.json", earnings_context.to_dict(), str(report_dir))
-            save_json_artifact("breadth_context.json", breadth_context.to_dict(), str(report_dir))
-            save_json_artifact("data_quality_summary.json", data_quality_summary.to_dict(), str(report_dir))
-            save_json_artifact("pretrade_summary.json", pretrade_summary.to_dict(), str(report_dir))
+def show_action_center(action_center: dict[str, Any], risk_summary: dict[str, Any], pipeline_status: dict[str, Any]) -> None:
+    pipeline_state = pipeline_status.get("state", "unknown")
+    if pipeline_state == "running":
+        st.info("Analyse en cours. L'interface se mettra à jour quand le scan sera terminé.")
+    elif pipeline_state == "busy":
+        st.warning("Une autre analyse est déjà en cours. Attends quelques instants.")
+    elif pipeline_state == "failed":
+        st.error(f"La dernière analyse a échoué: {pipeline_status.get('message', 'erreur inconnue')}")
 
-            news_summary_df = pd.DataFrame(news_context.symbol_summary)
-            if news_summary_df.empty:
-                news_summary_df = pd.DataFrame(columns=["symbol", "articles", "avg_sentiment", "symbol_bias"])
+    headline = action_center.get("headline", "Aucune information disponible.")
+    next_step = action_center.get("next_step", "Lance une analyse pour commencer.")
+    status = action_center.get("status", "unknown")
 
-            news_articles_df = pd.DataFrame(news_context.articles)
-            if news_articles_df.empty:
-                news_articles_df = pd.DataFrame(columns=["symbol", "published_at", "provider", "title", "sentiment", "url"])
+    if status == "orders_ready":
+        st.success(f"{headline} — Prochaine action: {next_step}")
+    elif status == "analysis_ready_no_orders":
+        st.info(f"{headline} — Prochaine action: {next_step}")
+    else:
+        st.warning(f"{headline} — Prochaine action: {next_step}")
 
-            earnings_calendar_df = pd.DataFrame(earnings_context.calendar)
-            if earnings_calendar_df.empty:
-                earnings_calendar_df = pd.DataFrame(
-                    columns=["symbol", "earnings_date", "eps_estimate", "reported_eps", "surprise_pct", "days_to_event"]
-                )
+    warnings = action_center.get("warnings", []) if isinstance(action_center, dict) else []
+    if warnings:
+        with st.expander("Voir les avertissements du jour"):
+            for warning in warnings:
+                st.warning(warning)
 
-            save_dataframe_artifact("news_summary.csv", news_summary_df, str(report_dir))
-            save_dataframe_artifact("news_articles.csv", news_articles_df, str(report_dir))
-            save_dataframe_artifact("earnings_calendar.csv", earnings_calendar_df, str(report_dir))
+    cols = st.columns(4)
+    cols[0].metric("Ordres proposés", risk_summary.get("n_orders", 0))
+    cols[1].metric("Allocation estimée", f"${risk_summary.get('estimated_total_allocation', 0):,.0f}")
+    cols[2].metric("Cash restant", f"${risk_summary.get('estimated_cash_remaining', 0):,.0f}")
+    cols[3].metric("Risque estimé", f"${risk_summary.get('estimated_total_risk_amount', 0):,.0f}")
 
-            if not equity_curve.empty:
-                equity_curve.to_csv(report_dir / "equity_curve.csv", header=["equity"])
-            else:
-                pd.DataFrame(columns=["equity"]).to_csv(report_dir / "equity_curve.csv", index=False)
 
-            walkforward_summary, walkforward_windows_df = (
-                run_walkforward_analysis(
-                    market_data=eligible_data,
-                    benchmark_symbol=config.benchmark,
-                    rebalance_frequency=config.rebalance_frequency,
-                    transaction_cost_bps=config.transaction_cost_bps,
-                    context=MarketContext(
-                        macro_bias=config.macro_bias + macro_context.bias,
-                        news_bias=config.news_bias + news_context.market_bias,
-                        breadth_bias=effective_breadth_bias,
-                    ),
-                    regime_override=config.regime_override,
-                    strategy_config=config.strategy,
-                    max_positions_default=config.max_positions,
-                    train_months=config.walkforward.train_months,
-                    test_months=config.walkforward.test_months,
-                    max_windows=config.walkforward.max_windows,
-                )
-                if config.walkforward.enabled
-                else (_default_walkforward_summary(), pd.DataFrame())
-            )
-            save_json_artifact("walkforward_summary.json", walkforward_summary.to_dict(), str(report_dir))
-            _save_empty_or_df("walkforward_windows.csv", walkforward_windows_df, str(report_dir))
+def maybe_bootstrap_and_autorun(app_state: dict[str, Any], pipeline_status: dict[str, Any]) -> None:
+    refresh_minutes = int(app_state.get("refresh_minutes", 30))
+    if app_state.get("autopilot", True):
+        st_autorefresh(interval=refresh_minutes * 60 * 1000, key="assistant_refresh")
 
-            validation_summary = build_validation_summary(
-                config=config.validation,
-                initial_universe_count=len(symbols),
-                eligible_count=len(eligible_symbols),
-                ranked_count=len(ranked),
-                macro_error_count=len(macro_context.errors),
-                news_error_count=len(news_context.errors),
-                earnings_error_count=len(earnings_context.errors),
-                trade_count=len(trade_plan),
-            )
-            for warning in data_quality_summary.warnings:
-                if warning not in validation_summary.warnings:
-                    validation_summary.warnings.append(warning)
-                    validation_summary.health_score = max(validation_summary.health_score - 3, 0)
-            if data_quality_summary.status == "error":
-                validation_summary.status = "error"
-                if "Données de marché insuffisantes au niveau qualité." not in validation_summary.errors:
-                    validation_summary.errors.append("Données de marché insuffisantes au niveau qualité.")
-            elif validation_summary.status == "ok" and validation_summary.warnings:
-                validation_summary.status = "warning"
-            save_json_artifact("validation_summary.json", validation_summary.to_dict(), str(report_dir))
-
-            performance_diagnostics = build_performance_diagnostics(equity_curve, market_data[config.benchmark])
-            save_json_artifact("performance_diagnostics.json", performance_diagnostics.to_dict(), str(report_dir))
-
-            sensitivity_summary, sensitivity_df = run_sensitivity_analysis(
-                market_data=eligible_data,
-                benchmark_symbol=config.benchmark,
-                rebalance_frequency=config.rebalance_frequency,
-                transaction_cost_bps=config.transaction_cost_bps,
-                context=MarketContext(
-                    macro_bias=config.macro_bias + macro_context.bias,
-                    news_bias=config.news_bias + news_context.market_bias,
-                    breadth_bias=effective_breadth_bias,
-                ),
-                regime_override=config.regime_override,
-                base_min_score=config.strategy.min_score,
-                base_max_positions=config.max_positions,
-                config=config.sensitivity,
-            )
-            save_json_artifact("sensitivity_summary.json", sensitivity_summary.to_dict(), str(report_dir))
-            _save_empty_or_df("sensitivity_grid.csv", sensitivity_df, str(report_dir))
-
-            stress_summary_pre = run_stress_tests(trade_plan)
-
-            if config.metarisk.enabled:
-                trade_plan, meta_risk_summary = apply_meta_risk_overlays(
-                    trade_plan=trade_plan,
-                    config=config.metarisk,
-                    regime=regime,
-                    breadth_bias=effective_breadth_bias,
-                    validation_summary=validation_summary.to_dict(),
-                    stress_summary=stress_summary_pre.to_dict(),
-                    walkforward_summary=walkforward_summary.to_dict(),
-                )
-            else:
-                meta_risk_summary = _default_meta_summary("Meta-risk désactivé dans la configuration.")
-            save_json_artifact("meta_risk_summary.json", meta_risk_summary.to_dict(), str(report_dir))
-
-            risk_summary = summarize_risk(
-                trade_plan=trade_plan,
-                capital=config.initial_capital,
-                max_positions=config.max_positions,
-                risk_per_trade=config.risk_per_trade,
-            )
-            stress_summary = run_stress_tests(trade_plan)
-            attribution_summary = build_attribution_summary(trade_plan)
-            monte_carlo_summary = run_monte_carlo_analysis(equity_curve, config.montecarlo)
-
-            if config.killswitch.enabled:
-                trade_plan, kill_switch_summary = apply_kill_switch(
-                    trade_plan=trade_plan,
-                    config=config.killswitch,
-                    validation_summary=validation_summary.to_dict(),
-                    meta_risk_summary=meta_risk_summary.to_dict(),
-                    monte_carlo_summary=monte_carlo_summary.to_dict(),
-                    stress_summary=stress_summary.to_dict(),
-                )
-            else:
-                kill_switch_summary = {"blocked": False, "severity": "none", "reasons": ["Kill switch désactivé."]}
-
-            # Recompute post-kill-switch summaries if needed
-            risk_summary = summarize_risk(
-                trade_plan=trade_plan,
-                capital=config.initial_capital,
-                max_positions=config.max_positions,
-                risk_per_trade=config.risk_per_trade,
-            )
-            stress_summary = run_stress_tests(trade_plan)
-            attribution_summary = build_attribution_summary(trade_plan)
-            exposure_summary = build_exposure_summary(trade_plan, config.initial_capital)
-            decision_journal = build_decision_journal(
-                ranked=ranked,
-                trade_plan=trade_plan,
-                regime=regime,
-                macro_bias=context.macro_bias,
-                news_bias=context.news_bias,
-                breadth_bias=context.breadth_bias,
-            )
-            anomaly_summary = detect_anomalies(ranked, trade_plan)
-
-            save_json_artifact("risk_summary.json", risk_summary, str(report_dir))
-            save_json_artifact("stress_test_summary.json", stress_summary.to_dict(), str(report_dir))
-            save_json_artifact("attribution_summary.json", attribution_summary.to_dict(), str(report_dir))
-            save_json_artifact("exposure_summary.json", exposure_summary.to_dict(), str(report_dir))
-            save_json_artifact("decision_journal.json", decision_journal.to_dict(), str(report_dir))
-            save_json_artifact("anomaly_summary.json", anomaly_summary.to_dict(), str(report_dir))
-            save_json_artifact("monte_carlo_summary.json", monte_carlo_summary.to_dict(), str(report_dir))
-            save_json_artifact("kill_switch_summary.json", kill_switch_summary.to_dict() if hasattr(kill_switch_summary, 'to_dict') else kill_switch_summary, str(report_dir))
-
-            broker_health_summary = check_broker_health(config.broker)
-            save_json_artifact("broker_health_summary.json", broker_health_summary.to_dict(), str(report_dir))
-
-            monitoring_summary = build_monitoring_summary(
-                validation_summary=validation_summary.to_dict(),
-                meta_risk_summary=meta_risk_summary.to_dict(),
-                kill_switch_summary=kill_switch_summary.to_dict() if hasattr(kill_switch_summary, 'to_dict') else kill_switch_summary,
-                broker_health_summary=broker_health_summary.to_dict(),
-            )
-            save_json_artifact("monitoring_summary.json", monitoring_summary.to_dict(), str(report_dir))
-
-            readiness_summary = build_readiness_summary(
-                validation_summary=validation_summary.to_dict(),
-                data_quality_summary=data_quality_summary.to_dict(),
-                meta_risk_summary=meta_risk_summary.to_dict(),
-                kill_switch_summary=kill_switch_summary.to_dict() if hasattr(kill_switch_summary, 'to_dict') else kill_switch_summary,
-                performance_diagnostics=performance_diagnostics.to_dict(),
-                sensitivity_summary=sensitivity_summary.to_dict(),
-                broker_health_summary=broker_health_summary.to_dict(),
-                monte_carlo_summary=monte_carlo_summary.to_dict(),
-            )
-            save_json_artifact("readiness_summary.json", readiness_summary.to_dict(), str(report_dir))
-
-            orders: list[BrokerOrder] = []
-            if not trade_plan.empty:
-                for _, row in trade_plan.iterrows():
-                    orders.append(
-                        BrokerOrder(
-                            symbol=str(row.get("symbol")),
-                            side="BUY",
-                            qty=to_int(row.get("qty")),
-                            order_type="LMT",
-                            reference_price=to_float(row.get("close")),
-                            stop_loss=to_float(row.get("stop_loss")),
-                            take_profit=to_float(row.get("take_profit")),
-                            rationale=str(row.get("reasons", "")),
-                        )
-                    )
-                ManualApprovalBroker().submit_orders(orders, str(report_dir / "orders_to_review.csv"))
-            else:
-                empty_orders_df().to_csv(report_dir / "orders_to_review.csv", index=False)
-
-            ibkr_broker = IBKRManualApprovalBroker(
-                host=config.broker.ibkr_host,
-                port=config.broker.ibkr_port,
-                client_id=config.broker.client_id,
-                account=config.broker.account,
-                paper_only=config.broker.paper_only,
-                currency=config.broker.currency,
-                exchange=config.broker.exchange,
-            )
-            ibkr_broker.submit_approved_orders(
-                review_csv=str(report_dir / "orders_to_review.csv"),
-                payload_output_path=str(report_dir / "ibkr_order_payloads_preview.json"),
-                dry_run=True,
-            )
-
-            action_center = build_action_center(
-                ranked=ranked,
-                trade_plan=trade_plan,
-                regime=regime,
-                macro_bias=context.macro_bias,
-                market_news_bias=context.news_bias,
-                breadth_bias=context.breadth_bias,
-                paper_only=config.broker.paper_only,
-                validation_summary=validation_summary.to_dict(),
-                meta_risk_summary=meta_risk_summary.to_dict(),
-                kill_switch_summary=kill_switch_summary.to_dict() if hasattr(kill_switch_summary, 'to_dict') else kill_switch_summary,
-                readiness_summary=readiness_summary.to_dict(),
-            )
-            save_json_artifact("action_center.json", action_center, str(report_dir))
-
-            # First-pass audit manifest on already generated artifacts
-            audit_manifest = build_audit_manifest(
-                config_path=config_path,
-                artifact_paths=[
-                    report_dir / "ranked_signals.csv",
-                    report_dir / "orders_to_review.csv",
-                    report_dir / "risk_summary.json",
-                    report_dir / "stress_test_summary.json",
-                    report_dir / "walkforward_summary.json",
-                    report_dir / "validation_summary.json",
-                    report_dir / "meta_risk_summary.json",
-                    report_dir / "kill_switch_summary.json",
-                    report_dir / "broker_health_summary.json",
-                    report_dir / "monitoring_summary.json",
-                    report_dir / "data_quality_summary.json",
-                    report_dir / "decision_journal.json",
-                    report_dir / "readiness_summary.json",
-                    report_dir / "history_summary.json",
-                    report_dir / "learning_summary.json",
-                ],
-            )
-            save_json_artifact("audit_manifest.json", audit_manifest.to_dict(), str(report_dir))
-
-            regression_checklist = build_regression_checklist(
-                {
-                    "pipeline_status": True,
-                    "ranked_signals": (report_dir / "ranked_signals.csv").exists(),
-                    "risk_summary": (report_dir / "risk_summary.json").exists(),
-                    "stress_test_summary": (report_dir / "stress_test_summary.json").exists(),
-                    "walkforward_summary": (report_dir / "walkforward_summary.json").exists(),
-                    "monitoring_summary": (report_dir / "monitoring_summary.json").exists(),
-                    "history_summary": (report_dir / "history_summary.json").exists(),
-                    "learning_summary": (report_dir / "learning_summary.json").exists(),
-                    "audit_manifest": (report_dir / "audit_manifest.json").exists(),
-                }
-            )
-            save_json_artifact("regression_checklist.json", regression_checklist.to_dict(), str(report_dir))
-
-            # Final audit manifest now includes regression checklist existence too
-            audit_manifest = build_audit_manifest(
-                config_path=config_path,
-                artifact_paths=[
-                    report_dir / "ranked_signals.csv",
-                    report_dir / "orders_to_review.csv",
-                    report_dir / "risk_summary.json",
-                    report_dir / "stress_test_summary.json",
-                    report_dir / "walkforward_summary.json",
-                    report_dir / "validation_summary.json",
-                    report_dir / "meta_risk_summary.json",
-                    report_dir / "kill_switch_summary.json",
-                    report_dir / "broker_health_summary.json",
-                    report_dir / "monitoring_summary.json",
-                    report_dir / "data_quality_summary.json",
-                    report_dir / "decision_journal.json",
-                    report_dir / "readiness_summary.json",
-                    report_dir / "history_summary.json",
-                    report_dir / "learning_summary.json",
-                    report_dir / "regression_checklist.json",
-                    report_dir / "audit_manifest.json",
-                ],
-            )
-            save_json_artifact("audit_manifest.json", audit_manifest.to_dict(), str(report_dir))
-
-            context_summary = (
-                f"macro_bias_total={context.macro_bias:+.2f}, "
-                f"market_news_bias_total={context.news_bias:+.2f}, "
-                f"breadth_bias_total={context.breadth_bias:+.2f}, "
-                f"regime={regime}"
-            )
-            save_report(
-                report_dir=str(report_dir),
-                benchmark=config.benchmark,
-                regime=regime,
-                context_summary=context_summary,
-                eligible_symbols=eligible_symbols,
-                ranked=ranked,
-                trade_plan=trade_plan,
-                backtest_stats=stats,
-                macro_context=macro_context.to_dict(),
-                news_summary=news_summary_df,
-                earnings_calendar=earnings_calendar_df,
-                breadth_context=breadth_context.to_dict(),
-                validation_summary=validation_summary.to_dict(),
-                risk_summary=risk_summary,
-                stress_summary=stress_summary.to_dict(),
-                walkforward_summary=walkforward_summary.to_dict(),
-                monte_carlo_summary=monte_carlo_summary.to_dict(),
-                attribution_summary=attribution_summary.to_dict(),
-                pretrade_summary=pretrade_summary.to_dict(),
-                meta_risk_summary=meta_risk_summary.to_dict(),
-                kill_switch_summary=kill_switch_summary.to_dict() if hasattr(kill_switch_summary, 'to_dict') else kill_switch_summary,
-                performance_diagnostics=performance_diagnostics.to_dict(),
-                sensitivity_summary=sensitivity_summary.to_dict(),
-                broker_health_summary=broker_health_summary.to_dict(),
-                monitoring_summary=monitoring_summary.to_dict(),
-                data_quality_summary=data_quality_summary.to_dict(),
-                exposure_summary=exposure_summary.to_dict(),
-                decision_journal=decision_journal.to_dict(),
-                audit_manifest=audit_manifest.to_dict(),
-                readiness_summary=readiness_summary.to_dict(),
-                anomaly_summary=anomaly_summary.to_dict(),
-                regression_checklist=regression_checklist.to_dict(),
-            )
-
-            history_run_id = store_pipeline_run(
-                db_path=config.database.path,
-                regime=regime,
-                health_score=validation_summary.health_score,
-                readiness_score=readiness_summary.readiness_score,
-                ranked=ranked,
-                trade_plan=trade_plan,
-                report_payload={
-                    "context_summary": context_summary,
-                    "validation_status": validation_summary.status,
-                    "meta_confidence": meta_risk_summary.confidence_score,
-                    "kill_switch_blocked": kill_switch_summary.blocked if hasattr(kill_switch_summary, 'blocked') else bool(kill_switch_summary.get('blocked', False)),
-                },
-            )
-            updated_outcomes = update_signal_outcomes(config.database.path, market_data)
-            history_summary = load_history_summary(config.database.path).to_dict()
-            learning_summary = load_learning_summary(config.database.path).to_dict()
-            save_json_artifact("history_summary.json", history_summary, str(report_dir))
-            save_json_artifact("learning_summary.json", learning_summary, str(report_dir))
-
-            pipeline_status = {
-                "state": "completed",
-                "completed_at": utc_now_iso(),
-                "initial_universe_count": len(symbols),
-                "eligible_universe_count": len(eligible_symbols),
-                "ranked_count": int(len(ranked)),
-                "orders_count": int(len(trade_plan)),
-                "approved_count": 0,
-                "regime": regime,
-                "macro_bias": macro_context.bias,
-                "market_news_bias": news_context.market_bias,
-                "breadth_bias": effective_breadth_bias,
-                "paper_only": config.broker.paper_only,
-                "validation_status": validation_summary.status,
-                "health_score": validation_summary.health_score,
-                "meta_risk_confidence": meta_risk_summary.confidence_score,
-                "meta_exposure_multiplier": meta_risk_summary.exposure_multiplier,
-                "kill_switch_blocked": kill_switch_summary.blocked if hasattr(kill_switch_summary, 'blocked') else bool(kill_switch_summary.get('blocked', False)),
-                "data_quality_status": data_quality_summary.status,
-                "data_coverage_ratio": data_quality_summary.coverage_ratio,
-                "monitoring_alert_level": monitoring_summary.alert_level,
-                "readiness_score": readiness_summary.readiness_score,
-                "readiness_status": readiness_summary.status,
-                "anomaly_count": anomaly_summary.flagged_orders + anomaly_summary.flagged_signals,
-                "regression_status": regression_checklist.status,
-                "history_run_id": history_run_id,
-                "history_runs": len(history_summary.get("runs", [])),
-                "matured_signals": learning_summary.get("matured_signals", 0),
-                "updated_outcomes": updated_outcomes,
-                "database_path": config.database.path,
-                "report_dir": str(report_dir),
-            }
-            save_json_artifact("pipeline_status.json", pipeline_status, str(report_dir))
-
-            print("Pipeline terminé.")
-            print(f"- Univers initial: {len(symbols)} symboles")
-            print(f"- Univers éligible: {len(eligible_symbols)} symboles")
-            print(f"- Régime détecté: {regime}")
-            print(f"- Macro bias calculé: {macro_context.bias:+.2f}")
-            print(f"- Market news bias calculé: {news_context.market_bias:+.2f}")
-            print(f"- Breadth bias calculé: {effective_breadth_bias:+.2f}")
-            print(f"- Rapport: {report_dir / 'latest_report.md'}")
-            print(f"- Ordres à valider: {report_dir / 'orders_to_review.csv'}")
-            print(f"- Preview IBKR: {report_dir / 'ibkr_order_payloads_preview.json'}")
-        except Exception as exc:
-            save_json_artifact(
-                "pipeline_status.json",
-                {
-                    "state": "failed",
-                    "failed_at": utc_now_iso(),
-                    "message": str(exc),
-                    "traceback": traceback.format_exc(),
-                    "report_dir": str(report_dir),
-                },
-                str(report_dir),
-            )
-            raise
+    if should_auto_run(app_state, pipeline_status):
+        app_state["last_auto_attempt"] = to_iso_now()
+        save_app_state(app_state)
+        with st.spinner("Analyse automatique en cours..."):
+            ok = run_analysis_cycle(auto_preview=bool(app_state.get("auto_preview", True)))
+        if ok:
+            app_state["last_auto_success"] = to_iso_now()
+            save_app_state(app_state)
+            st.success("Analyse automatique terminée.")
+        else:
+            save_app_state(app_state)
+            st.error("L'analyse automatique a échoué. Vérifie les journaux dans l'onglet Détails.")
+        st.rerun()
 
 
 def main() -> None:
-    args = parse_args()
-    run_pipeline(args.config)
+    st.set_page_config(page_title="Assistant Trading Débutant", layout="wide", initial_sidebar_state="expanded")
+    ensure_session_defaults()
+    inject_css()
+
+    cfg = load_config()
+    app_state = load_app_state()
+    pipeline_status = get_pipeline_status()
+    maybe_bootstrap_and_autorun(app_state, pipeline_status)
+
+    cfg = load_config()
+    app_state = load_app_state()
+    pipeline_status = get_pipeline_status()
+
+    report_md_path = REPORTS_DIR / "latest_report.md"
+    ranked = normalize_ranked(read_csv_safe(str(REPORTS_DIR / "ranked_signals.csv")))
+    orders = normalize_orders(read_csv_safe(str(REPORTS_DIR / "orders_to_review.csv")))
+    backtest = read_json_safe(str(REPORTS_DIR / "backtest_stats.json"))
+    macro = read_json_safe(str(REPORTS_DIR / "macro_context.json"))
+    breadth = read_json_safe(str(REPORTS_DIR / "breadth_context.json"))
+    news = read_csv_safe(str(REPORTS_DIR / "news_summary.csv"))
+    earnings = read_csv_safe(str(REPORTS_DIR / "earnings_calendar.csv"))
+    preview_payload = read_json_safe(str(REPORTS_DIR / "alpaca_orders_log.json"))
+    submission_log = read_json_safe(str(REPORTS_DIR / "alpaca_orders_log.json"))
+    action_center = read_json_safe(str(REPORTS_DIR / "action_center.json"))
+    risk_summary = read_json_safe(str(REPORTS_DIR / "risk_summary.json"))
+    validation_summary = read_json_safe(str(REPORTS_DIR / "validation_summary.json"))
+    stress_summary = read_json_safe(str(REPORTS_DIR / "stress_test_summary.json"))
+    walkforward_summary = read_json_safe(str(REPORTS_DIR / "walkforward_summary.json"))
+    monte_carlo_summary = read_json_safe(str(REPORTS_DIR / "monte_carlo_summary.json"))
+    attribution_summary = read_json_safe(str(REPORTS_DIR / "attribution_summary.json"))
+    meta_risk_summary = read_json_safe(str(REPORTS_DIR / "meta_risk_summary.json"))
+    pretrade_summary = read_json_safe(str(REPORTS_DIR / "pretrade_summary.json"))
+    kill_switch_summary = read_json_safe(str(REPORTS_DIR / "kill_switch_summary.json"))
+    performance_diagnostics = read_json_safe(str(REPORTS_DIR / "performance_diagnostics.json"))
+    sensitivity_summary = read_json_safe(str(REPORTS_DIR / "sensitivity_summary.json"))
+    broker_health_summary = read_json_safe(str(REPORTS_DIR / "broker_health_summary.json"))
+    monitoring_summary = read_json_safe(str(REPORTS_DIR / "monitoring_summary.json"))
+    readiness_summary = read_json_safe(str(REPORTS_DIR / "readiness_summary.json"))
+    anomaly_summary = read_json_safe(str(REPORTS_DIR / "anomaly_summary.json"))
+    regression_checklist = read_json_safe(str(REPORTS_DIR / "regression_checklist.json"))
+    data_quality_summary = read_json_safe(str(REPORTS_DIR / "data_quality_summary.json"))
+    exposure_summary = read_json_safe(str(REPORTS_DIR / "exposure_summary.json"))
+    decision_journal = read_json_safe(str(REPORTS_DIR / "decision_journal.json"))
+    db_path = cfg.get("database", {}).get("path", "data/trading_agent.sqlite") if cfg else "data/trading_agent.sqlite"
+    history_summary = load_history_summary(db_path).to_dict()
+    learning_summary = load_learning_summary(db_path).to_dict()
+
+    show_hero(app_state, pipeline_status, cfg)
+    show_action_center(action_center, risk_summary, pipeline_status)
+
+    st.markdown("### Actions rapides")
+    qa1, qa2, qa3 = st.columns(3)
+    if qa1.button("Lancer tout maintenant", type="primary", use_container_width=True, key="top_run_now"):
+        with st.spinner("Analyse + préparation broker en cours..."):
+            ok = run_analysis_cycle(auto_preview=bool(app_state.get("auto_preview", True)))
+        if ok:
+            st.success("Analyse lancée depuis la page principale.")
+        else:
+            st.error("Le lancement a échoué. Regarde l'onglet Détails et aide.")
+        st.rerun()
+    if qa2.button("Préparer le broker", use_container_width=True, key="top_prepare_preview"):
+        ok = generate_preview()
+        if ok:
+            st.success("Preview broker préparé.")
+        else:
+            st.error("Impossible de préparer le preview broker.")
+        st.rerun()
+    if qa3.button("Vérifier l'installation", use_container_width=True, key="top_run_doctor"):
+        ok = run_doctor()
+        if ok:
+            st.success("Diagnostic OK.")
+        else:
+            st.error("Le diagnostic a trouvé un problème. Regarde l'onglet Détails et aide.")
+
+    st.caption("Si tu ne vois pas la barre latérale, utilise ces boutons rapides au centre de la page.")
+
+    with st.sidebar:
+        st.header("Réglages simples")
+        current_capital = float(cfg.get("initial_capital", 100000))
+        capital = st.number_input("Capital de départ ($)", min_value=1000.0, max_value=10000000.0, value=current_capital, step=1000.0)
+
+        current_rpt = float(cfg.get("risk_per_trade", 0.01))
+        default_risk = "Équilibré"
+        if current_rpt <= 0.005:
+            default_risk = "Prudent"
+        elif current_rpt >= 0.015:
+            default_risk = "Dynamique"
+        risk_level = st.selectbox("Profil de risque", ["Prudent", "Équilibré", "Dynamique"], index=["Prudent", "Équilibré", "Dynamique"].index(default_risk))
+
+        paper_only = st.checkbox("Mode démo uniquement", value=bool(cfg.get("broker", {}).get("paper_only", True)))
+        autopilot = st.checkbox("Pilote automatique", value=bool(app_state.get("autopilot", True)))
+        refresh_minutes = st.slider("Rafraîchir toutes les X minutes", min_value=5, max_value=180, value=int(app_state.get("refresh_minutes", 30)), step=5)
+        auto_preview = st.checkbox("Préparer automatiquement le broker après analyse", value=bool(app_state.get("auto_preview", True)))
+
+        if st.button("Enregistrer mes réglages", use_container_width=True):
+            update_beginner_settings(capital, risk_level, paper_only)
+            app_state["autopilot"] = bool(autopilot)
+            app_state["refresh_minutes"] = int(refresh_minutes)
+            app_state["auto_preview"] = bool(auto_preview)
+            save_app_state(app_state)
+            st.success("Réglages enregistrés.")
+            st.rerun()
+
+        st.markdown("---")
+        if st.button("Lancer tout maintenant", type="primary", use_container_width=True):
+            with st.spinner("Analyse + préparation broker en cours..."):
+                ok = run_analysis_cycle(auto_preview=bool(auto_preview))
+            if ok:
+                st.success("Tout est prêt.")
+            else:
+                st.error("Le lancement a échoué.")
+            st.rerun()
+
+        if st.button("Vérifier mon installation", use_container_width=True):
+            ok = run_doctor()
+            if ok:
+                st.success("Installation vérifiée.")
+            else:
+                st.error("Le diagnostic a trouvé un problème. Regarde l'onglet Détails et aide.")
+
+        st.caption("Astuce : laisse le pilote automatique activé pour n'avoir qu'à revenir autoriser les trades.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Opportunités trouvées", int(len(ranked)))
+    c2.metric("Trades à autoriser", int(len(orders)))
+    c3.metric("Contexte macro", f"{float(macro.get('bias', 0.0)):+.2f}")
+    c4.metric("Health score", validation_summary.get("health_score", "n/a"))
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Régime", pipeline_status.get("regime", "n/a"))
+    c6.metric("Meta confiance", meta_risk_summary.get("confidence_score", "n/a"))
+    c7.metric("Expo meta", meta_risk_summary.get("exposure_multiplier", "n/a"))
+    c8.metric("MC proba perte", monte_carlo_summary.get("prob_negative_return", "n/a"))
+
+    c9, c10, c11, c12 = st.columns(4)
+    c9.metric("Kill switch", "ON" if kill_switch_summary.get("blocked") else "OFF")
+    c10.metric("Info ratio", performance_diagnostics.get("information_ratio", "n/a"))
+    c11.metric("Sensibilité +Sharpe", sensitivity_summary.get("positive_sharpe_ratio", "n/a"))
+    c12.metric("Excès vs bench", performance_diagnostics.get("excess_return", "n/a"))
+
+    c13, c14 = st.columns(2)
+    c13.metric("Broker santé", "OK" if broker_health_summary.get("reachable") else "DOWN")
+    c14.metric("Monitoring", monitoring_summary.get("alert_level", "n/a"))
+
+    c15, c16 = st.columns(2)
+    c15.metric("Readiness", readiness_summary.get("readiness_score", "n/a"))
+    c16.metric("Anomalies", anomaly_summary.get("flagged_orders", 0) + anomaly_summary.get("flagged_signals", 0) if anomaly_summary else "n/a")
+
+    c17, c18 = st.columns(2)
+    c17.metric("Scans mémorisés", len(history_summary.get("runs", [])))
+    c18.metric("Signaux mémorisés", len(history_summary.get("recent_signals", [])))
+
+    c19, c20 = st.columns(2)
+    c19.metric("Signaux maturés", learning_summary.get("matured_signals", 0))
+    c20.metric("Win rate 20j", history_summary.get("signal_outcome_summary", {}).get("win_rate_20d", "n/a"))
+
+    step1_done = bool(pipeline_status)
+    step2_done = not ranked.empty
+    step3_done = not orders.empty
+    step4_done = bool(preview_payload)
+
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        show_step_card("1. Analyse du marché", step1_done, "Le bot scanne automatiquement actions, macro, news et earnings.")
+    with s2:
+        show_step_card("2. Sélection des opportunités", step2_done, "Le système choisit les meilleures idées de trades et les classe.")
+    with s3:
+        show_step_card("3. Ton autorisation", step3_done, "Tu coches seulement les trades que tu acceptes.")
+    with s4:
+        show_step_card("4. Préparation broker", step4_done, "Le système prépare l'envoi au broker démo automatiquement.")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Vue guidée", "Autoriser les trades", "Marché expliqué simplement", "Historique & learning", "Détails et aide"])
+
+    with tab1:
+        st.subheader("Les meilleures idées du moment")
+        top_symbols = action_center.get("top_symbols", []) if isinstance(action_center, dict) else []
+        if top_symbols:
+            st.caption("Résumé rapide des 3 meilleures idées détectées")
+            st.json(top_symbols)
+        if ranked.empty:
+            st.info("Aucune analyse disponible pour le moment. Utilise le bouton 'Lancer tout maintenant'.")
+        else:
+            for _, row in ranked.head(5).iterrows():
+                score = float(row.get("score", 0.0))
+                strength, emoji = signal_strength(score)
+                with st.container(border=True):
+                    st.markdown(f"### {emoji} {row['symbol']} — score {score:.2f}")
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.write(f"**Prix actuel** : {row.get('close', 'n/a')}")
+                    col_b.write(f"**Momentum 20 jours** : {row.get('mom_20', 'n/a')}")
+                    col_c.write(f"**Qualité estimée** : {strength}")
+                    st.write("**Explication simple**")
+                    st.write(str(row.get("reasons", "Pas d'explication disponible.")))
+
+        st.markdown("---")
+        st.subheader("Lecture ultra simple")
+        if not orders.empty:
+            st.success(f"Le système a préparé {len(orders)} trade(s) à examiner.")
+        else:
+            st.info("Aucun trade n'est proposé pour l'instant.")
+
+        macro_bias = float(macro.get("bias", 0.0)) if macro else 0.0
+        if macro_bias > 0.2:
+            st.success("Le contexte global est plutôt favorable au risque.")
+        elif macro_bias < -0.2:
+            st.warning("Le contexte global est plutôt prudent. Le système restera plus sélectif.")
+        else:
+            st.info("Le contexte global est neutre.")
+
+        if preview_payload:
+            st.success("Le preview broker est déjà prêt. Il ne manque plus que ton autorisation éventuelle.")
+
+    with tab2:
+        st.subheader("Autoriser ou refuser les trades")
+        st.write("Tu n'as qu'une seule vraie action à faire ici : dire OUI ou NON à chaque trade proposé.")
+
+        if orders.empty:
+            st.info("Aucun trade à autoriser pour le moment.")
+        else:
+            init_approval_state(orders)
+
+            b1, b2, b3 = st.columns(3)
+            if b1.button("Autoriser les 3 premiers", use_container_width=True):
+                set_bulk_approvals(orders, "top3")
+            if b2.button("Tout autoriser", use_container_width=True):
+                set_bulk_approvals(orders, "all")
+            if b3.button("Tout refuser", use_container_width=True):
+                set_bulk_approvals(orders, "none")
+
+            for idx, row in orders.reset_index(drop=True).iterrows():
+                key = approval_key(idx, str(row["symbol"]))
+                with st.container(border=True):
+                    c_left, c_right = st.columns([2, 1])
+                    with c_left:
+                        st.checkbox(f"J'autorise le trade sur {row['symbol']}", key=key)
+                        st.write(f"**Pourquoi ce trade ?** {row['rationale']}")
+                    with c_right:
+                        st.write(f"**Qté** : {row['qty']}")
+                        st.write(f"**Prix** : {row['reference_price']}")
+                        st.write(f"**Stop** : {row['stop_loss']}")
+                        st.write(f"**Objectif** : {row['take_profit']}")
+
+            c1, c2, c3 = st.columns(3)
+            if c1.button("Enregistrer mes choix", use_container_width=True):
+                updated = build_orders_from_session(orders)
+                save_orders(updated)
+                st.success("Tes choix ont été enregistrés.")
+                st.rerun()
+
+            if c2.button("Préparer le broker avec mes choix", use_container_width=True):
+                updated = build_orders_from_session(orders)
+                save_orders(updated)
+                ok = generate_preview()
+                if ok:
+                    st.success("Le preview broker est prêt.")
+                else:
+                    st.error("Impossible de préparer le broker.")
+                st.rerun()
+
+            broker_demo = bool(load_config().get("broker", {}).get("paper_only", True))
+            submit_label = "Envoyer au broker démo" if broker_demo else "Envoyer au broker"
+            if c3.button(submit_label, use_container_width=True):
+                updated = build_orders_from_session(orders)
+                save_orders(updated)
+                ok = submit_orders()
+                if ok:
+                    st.success("Ordres envoyés avec succès.")
+                else:
+                    st.error("Échec lors de l'envoi des ordres.")
+                st.rerun()
+
+            approved_count = int(build_orders_from_session(orders)["approved"].sum())
+            st.metric("Trades autorisés par toi", approved_count)
+
+            if preview_payload:
+                with st.expander("Voir ce qui sera envoyé au broker"):
+                    st.json(preview_payload)
+
+    with tab3:
+        st.subheader("Le marché expliqué sans jargon compliqué")
+        st.markdown("### Macro")
+        if macro:
+            st.write(f"**Score macro global** : {float(macro.get('bias', 0.0)):+.2f}")
+            for item in macro.get("summary", []):
+                st.write(f"- {item}")
+        else:
+            st.info("Pas encore de lecture macro disponible.")
+
+        st.markdown("### Breadth de marché")
+        if breadth:
+            st.json(breadth)
+        else:
+            st.info("Pas encore de résumé breadth disponible.")
+
+        st.markdown("### Qualité des données")
+        if data_quality_summary:
+            st.json(data_quality_summary)
+        else:
+            st.info("Pas encore de résumé qualité de données.")
+
+        st.markdown("### News")
+        if not news.empty:
+            st.dataframe(news.sort_values("symbol_bias", ascending=False), use_container_width=True, hide_index=True)
+        else:
+            st.info("Pas encore de résumé news disponible.")
+
+        st.markdown("### Résultats d'entreprises proches")
+        if not earnings.empty:
+            st.dataframe(earnings.head(20), use_container_width=True, hide_index=True)
+        else:
+            st.info("Aucun résultat proche détecté.")
+
+        st.markdown("### Validation / santé du système")
+        if validation_summary:
+            st.json(validation_summary)
+        else:
+            st.info("Pas encore de résumé de validation.")
+
+        st.markdown("### Mémoire / apprentissage")
+        if learning_summary:
+            st.json(learning_summary)
+        else:
+            st.info("Pas encore de résumé d'apprentissage.")
+
+        st.markdown("### Readiness")
+        if readiness_summary:
+            st.json(readiness_summary)
+        else:
+            st.info("Pas encore de résumé readiness.")
+
+        st.markdown("### Meta-risk")
+        if meta_risk_summary:
+            st.json(meta_risk_summary)
+        else:
+            st.info("Pas encore de résumé meta-risk.")
+
+        st.markdown("### Kill switch")
+        if kill_switch_summary:
+            st.json(kill_switch_summary)
+        else:
+            st.info("Pas encore de résumé kill switch.")
+
+        st.markdown("### Diagnostics de performance")
+        if performance_diagnostics:
+            st.json(performance_diagnostics)
+        else:
+            st.info("Pas encore de diagnostic de performance.")
+
+        st.markdown("### Santé broker / monitoring")
+        if broker_health_summary:
+            st.json(broker_health_summary)
+        else:
+            st.info("Pas encore de résumé broker.")
+        if monitoring_summary:
+            st.json(monitoring_summary)
+        else:
+            st.info("Pas encore de résumé monitoring.")
+
+    with tab4:
+        st.subheader("Historique & learning")
+
+        runs_df = pd.DataFrame(history_summary.get("runs", []))
+        run_timeseries_df = pd.DataFrame(history_summary.get("run_timeseries", []))
+        recent_orders_df = pd.DataFrame(history_summary.get("recent_orders", []))
+        recent_signals_df = pd.DataFrame(history_summary.get("recent_signals", []))
+        best_symbols_df = pd.DataFrame(history_summary.get("best_symbols_20d", []))
+        outcome_summary = history_summary.get("signal_outcome_summary", {})
+
+        if not run_timeseries_df.empty:
+            if "created_at" in run_timeseries_df.columns:
+                run_timeseries_df["created_at"] = pd.to_datetime(run_timeseries_df["created_at"], errors="coerce")
+                run_timeseries_df = run_timeseries_df.dropna(subset=["created_at"]).set_index("created_at")
+            st.markdown("### Évolution des scans")
+            cols = [c for c in ["health_score", "readiness_score", "ranked_count", "orders_count"] if c in run_timeseries_df.columns]
+            if cols:
+                st.line_chart(run_timeseries_df[cols], height=280)
+        else:
+            st.info("Pas encore assez d'historique pour afficher un graphique d'évolution.")
+
+        h1, h2, h3 = st.columns(3)
+        h1.metric("Runs historiques", len(history_summary.get("runs", [])))
+        h2.metric("Signaux maturés", learning_summary.get("matured_signals", 0))
+        h3.metric("Win rate 20j", outcome_summary.get("win_rate_20d", "n/a"))
+
+        st.markdown("### Résumé outcomes")
+        st.json(outcome_summary or {"info": "Pas encore assez de signaux maturés."})
+
+        st.markdown("### Recommandations du learning engine")
+        if learning_summary:
+            st.json(learning_summary)
+        else:
+            st.info("Pas encore de résumé d'apprentissage.")
+
+        if not best_symbols_df.empty:
+            st.markdown("### Meilleurs symboles observés (20j)")
+            st.dataframe(best_symbols_df, use_container_width=True, hide_index=True)
+
+        if not recent_signals_df.empty:
+            st.markdown("### Derniers signaux mémorisés")
+            st.dataframe(recent_signals_df.head(20), use_container_width=True, hide_index=True)
+
+        if not recent_orders_df.empty:
+            st.markdown("### Derniers ordres proposés")
+            st.dataframe(recent_orders_df.head(20), use_container_width=True, hide_index=True)
+
+    with tab5:
+        st.subheader("Détails et aide")
+        st.markdown(
+            """
+### Comment utiliser l'assistant ?
+1. Laisse le **pilote automatique** activé.
+2. Le système scanne le marché tout seul.
+3. Va dans **Autoriser les trades**.
+4. Coche uniquement les trades que tu acceptes.
+5. Clique sur **Envoyer au broker démo**.
+
+### Recommandation
+Au début, garde toujours le **mode démo uniquement**.
+            """
+        )
+
+        if report_md_path.exists():
+            with st.expander("Voir le rapport complet généré par le système"):
+                st.markdown(report_md_path.read_text(encoding="utf-8"))
+
+        with st.expander("Sortie du dernier lancement"):
+            st.code(st.session_state.get("last_run_stdout", "") or "Aucune sortie disponible.")
+            if st.session_state.get("last_run_stderr"):
+                st.error(st.session_state["last_run_stderr"])
+
+        with st.expander("Sortie du dernier envoi broker"):
+            st.code(st.session_state.get("last_submit_stdout", "") or "Aucune sortie disponible.")
+            if st.session_state.get("last_submit_stderr"):
+                st.error(st.session_state["last_submit_stderr"])
+
+        with st.expander("Diagnostic de l'installation"):
+            st.code(st.session_state.get("last_doctor_stdout", "") or "Aucun diagnostic lancé depuis l'interface.")
+            if st.session_state.get("last_doctor_stderr"):
+                st.error(st.session_state["last_doctor_stderr"])
+
+        if submission_log:
+            with st.expander("Journal d'envoi broker"):
+                st.json(submission_log)
+
+        with st.expander("Résumé risque portefeuille"):
+            st.json(risk_summary or {"info": "Aucun résumé risque disponible."})
+
+        with st.expander("Exposition portefeuille"):
+            st.json(exposure_summary or {"info": "Aucune exposition disponible."})
+
+        with st.expander("Journal de décision"):
+            st.json(decision_journal or {"info": "Aucun journal de décision disponible."})
+
+        with st.expander("Mémoire / historique"):
+            st.json(history_summary or {"info": "Aucun historique disponible."})
+
+        with st.expander("Learning engine supervisé"):
+            st.json(learning_summary or {"info": "Aucun apprentissage disponible."})
+
+        with st.expander("Anomalies détectées"):
+            st.json(anomaly_summary or {"info": "Aucun résumé d'anomalies disponible."})
+
+        with st.expander("Contrôles pré-trade"):
+            st.json(pretrade_summary or {"info": "Aucun résumé pré-trade disponible."})
+
+        with st.expander("Meta-risk overlay"):
+            st.json(meta_risk_summary or {"info": "Aucun résumé meta-risk disponible."})
+
+        with st.expander("Stress tests portefeuille"):
+            st.json(stress_summary or {"info": "Aucun stress test disponible."})
+
+        with st.expander("Walk-forward quant pro"):
+            st.json(walkforward_summary or {"info": "Aucun résumé walk-forward disponible."})
+
+        with st.expander("Monte Carlo"):
+            st.json(monte_carlo_summary or {"info": "Aucun résumé Monte Carlo disponible."})
+
+        with st.expander("Attribution facteurs"):
+            st.json(attribution_summary or {"info": "Aucune attribution disponible."})
+
+        with st.expander("Sensibilité des paramètres"):
+            st.json(sensitivity_summary or {"info": "Aucune sensibilité disponible."})
+
+        with st.expander("Diagnostics de performance"):
+            st.json(performance_diagnostics or {"info": "Aucun diagnostic de performance disponible."})
+
+        with st.expander("Kill switch"):
+            st.json(kill_switch_summary or {"info": "Aucun résumé kill switch disponible."})
+
+        with st.expander("Santé broker / monitoring"):
+            st.json({
+                "broker_health_summary": broker_health_summary or {"info": "Aucun résumé broker disponible."},
+                "monitoring_summary": monitoring_summary or {"info": "Aucun résumé monitoring disponible."},
+                "readiness_summary": readiness_summary or {"info": "Aucun résumé readiness disponible."},
+                "regression_checklist": regression_checklist or {"info": "Aucune checklist disponible."},
+            })
+
+        with st.expander("Paramètres automatiques actuels"):
+            st.json({
+                "config": cfg,
+                "app_state": app_state,
+                "pipeline_status": pipeline_status,
+                "action_center": action_center,
+                "validation_summary": validation_summary,
+            })
+
+    st.caption(f"Dernière consultation de l'interface : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 if __name__ == "__main__":
