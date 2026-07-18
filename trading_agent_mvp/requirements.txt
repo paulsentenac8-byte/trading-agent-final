@@ -1,8 +1,0 @@
-pandas>=2.2.0
-numpy>=1.26.0
-yfinance>=0.2.54
-python-dateutil>=2.9.0
-tabulate>=0.9.0
-streamlit>=1.38.0
-streamlit-autorefresh>=1.0.1
-plotly>=5.24.0
